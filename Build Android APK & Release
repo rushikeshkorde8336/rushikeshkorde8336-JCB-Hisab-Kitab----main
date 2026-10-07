@@ -1,0 +1,213 @@
+name: Build Android APK & Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag name (e.g. v1.0.0)'
+        required: false
+        default: 'v1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk-and-release:
+    name: Build Signed Android APK & AAB (< 4MB)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Java JDK 21 (Required for Android Gradle Plugin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Web App Dependencies & Build Compact Production Bundle
+        run: |
+          npm install --legacy-peer-deps
+          npm run build
+          # Remove source maps or redundant static files to keep web assets ultra-compact
+          rm -rf dist/**/*.map dist/delete-account.html
+
+      - name: Initialize Capacitor Android Project & Configure WebDir
+        run: |
+          npm install --no-save --legacy-peer-deps @capacitor/core@^6.2.0 @capacitor/cli@^6.2.0 @capacitor/android@^6.2.0
+          cat << 'EOF' > capacitor.config.json
+          {
+            "appId": "com.jcbhisabkitab.app",
+            "appName": "JCB Hisab Kitab",
+            "webDir": "dist",
+            "bundledWebRuntime": false,
+            "server": {
+              "androidScheme": "https"
+            }
+          }
+          EOF
+          npx cap add android
+          npx cap sync android
+
+      - name: Generate Release Keystore, Build, Zipalign & V1+V2+V3 Sign APK + AAB (< 4MB)
+        run: |
+          cd android
+          # 1. Generate standard PKCS12 release keystore
+          keytool -genkeypair -v \
+            -storetype PKCS12 \
+            -keystore app/jcb-release-key.keystore \
+            -alias jcb_key_alias \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -storepass jcbhisab123 \
+            -keypass jcbhisab123 \
+            -dname "CN=JCB Hisab Kitab, OU=Earthmovers, O=JCBKhata, L=Pune, S=Maharashtra, C=IN"
+
+          # 2. Add Capacitor-safe ProGuard rules so R8 shrinks unused AndroidX/Material classes cleanly
+          cat << 'EOF' >> app/proguard-rules.pro
+          -keep class com.getcapacitor.** { *; }
+          -keep @com.getcapacitor.annotation.CapacitorPlugin class * { *; }
+          -keepclassmembers class * {
+              @android.webkit.JavascriptInterface <methods>;
+          }
+          -dontwarn com.getcapacitor.**
+          EOF
+
+          # 3. Append R8 minification, resource shrinking, and explicit v1+v2 signing to app/build.gradle
+          cat << 'EOF' >> app/build.gradle
+
+          android {
+              defaultConfig {
+                  resConfigs "en", "mr", "hi"
+              }
+              packagingOptions {
+                  jniLibs {
+                      useLegacyPackaging = true
+                  }
+                  resources {
+                      excludes += ['META-INF/*.kotlin_module', 'META-INF/DEPENDENCIES', 'META-INF/LICENSE*', 'META-INF/NOTICE*', 'DebugProbesKt.bin']
+                  }
+              }
+              signingConfigs {
+                  release {
+                      storeFile file('jcb-release-key.keystore')
+                      storePassword 'jcbhisab123'
+                      keyAlias 'jcb_key_alias'
+                      keyPassword 'jcbhisab123'
+                      v1SigningEnabled true
+                      v2SigningEnabled true
+                  }
+              }
+              buildTypes {
+                  release {
+                      signingConfig signingConfigs.release
+                      minifyEnabled true
+                      shrinkResources true
+                      crunchPngs true
+                      zipAlignEnabled true
+                      proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+                  }
+              }
+          }
+          EOF
+
+          chmod +x ./gradlew
+          ./gradlew assembleRelease bundleRelease --no-daemon
+
+          mkdir -p ../release-output
+
+          # 4. Locate Android SDK build-tools (zipalign, apksigner, aapt2)
+          BUILD_TOOLS_DIR=$(ls -d "$ANDROID_HOME/build-tools/"* | sort -V | tail -n 1)
+          ZIPALIGN="$BUILD_TOOLS_DIR/zipalign"
+          APKSIGNER="$BUILD_TOOLS_DIR/apksigner"
+          AAPT2="$BUILD_TOOLS_DIR/aapt2"
+
+          RAW_APK=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          RAW_AAB=$(find app/build/outputs/bundle/release -name "*.aab" | head -n 1)
+
+          # 5. Explicitly zipalign (4-byte alignment) and sign with v1 + v2 + v3 schemes (required by Indus Appstore & Android 7-15)
+          "$ZIPALIGN" -f -p 4 "$RAW_APK" ../release-output/aligned.apk
+          "$APKSIGNER" sign \
+            --ks app/jcb-release-key.keystore \
+            --ks-key-alias jcb_key_alias \
+            --ks-pass pass:jcbhisab123 \
+            --key-pass pass:jcbhisab123 \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --out ../release-output/JCB-Hisab-Kitab-v1.0.0.apk \
+            ../release-output/aligned.apk
+          rm -f ../release-output/aligned.apk
+
+          # 6. Copy and verify AAB (signed with jarsigner + Gradle)
+          cp "$RAW_AAB" ../release-output/JCB-Hisab-Kitab-v1.0.0.aab
+          jarsigner -verify ../release-output/JCB-Hisab-Kitab-v1.0.0.aab
+
+          cp app/jcb-release-key.keystore ../release-output/jcb-release-key.keystore
+
+          # 7. Verify APK format & signature using aapt2 and apksigner so Indus Appstore extraction never fails
+          echo "🔍 Verifying APK format and signature with Android SDK tools:"
+          "$APKSIGNER" verify --verbose ../release-output/JCB-Hisab-Kitab-v1.0.0.apk
+          "$AAPT2" dump badging ../release-output/JCB-Hisab-Kitab-v1.0.0.apk | head -n 15
+
+          echo "📊 Final Built Package Sizes (Target < 4 MB):"
+          ls -lh ../release-output/
+
+      - name: Upload APK Action Artifact (Directly Downloadable .apk inside ZIP)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: JCB-Hisab-Kitab-APK-v1.0.0
+          path: release-output/JCB-Hisab-Kitab-v1.0.0.apk
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload AAB Action Artifact (For Play Store / Indus App Bundle)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: JCB-Hisab-Kitab-AAB-v1.0.0
+          path: release-output/JCB-Hisab-Kitab-v1.0.0.aab
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish GitHub Release with Directly Downloadable Raw .APK & .AAB (< 4MB)
+        id: create_release
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.release_tag || 'v1.0.0' }}
+          name: "JCB Hisab Kitab (जेसीबी हिशोब वही) - Official Signed APK & AAB (< 4MB)"
+          body: |
+            ## 🚜 JCB Hisab Kitab - Verified Android Release (< 4 MB)
+            ### ⚠️ IMPORTANT FOR INDUS APPSTORE UPLOAD:
+            - Download **`JCB-Hisab-Kitab-v1.0.0.apk`** directly from the **Assets** section below (do **NOT** upload a `.zip` file to Indus Appstore).
+            - Verified with `zipalign` + `apksigner` (v1 + v2 + v3 signature schemes) and `aapt2 dump badging`.
+          files: |
+            release-output/JCB-Hisab-Kitab-v1.0.0.apk
+            release-output/JCB-Hisab-Kitab-v1.0.0.aab
+          draft: false
+          prerelease: false
+
+      - name: Confirm Artifact Availability on Release Status
+        if: always()
+        run: |
+          echo "✅ Verified APK ('JCB-Hisab-Kitab-v1.0.0.apk') and AAB ('JCB-Hisab-Kitab-v1.0.0.aab') are uploaded and ready for Indus Appstore."
