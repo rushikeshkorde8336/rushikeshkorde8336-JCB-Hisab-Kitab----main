@@ -45,7 +45,21 @@ jobs:
           npm install --legacy-peer-deps
           npm run build
           # Remove source maps or redundant static files to keep web assets ultra-compact
-          rm -rf dist/**/*.map dist/delete-account.html
+          rm -rf dist/**/*.map dist/delete-account.html- name: Setup Java JDK 21 (Required for Android Gradle Plugin)
+  uses: actions/setup-java@v4
+  with:
+    distribution: 'temurin'
+    java-version: '21'
+
+- name: Setup Android SDK
+  uses: android-actions/setup-android@v3
+  with:
+    api-level: 34
+    build-tools-version: 34.0.0
+
+- name: Accept Androi
+d SDK Licenses
+  run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
 
       - name: Initialize Capacitor Android Project & Configure WebDir
         run: |
